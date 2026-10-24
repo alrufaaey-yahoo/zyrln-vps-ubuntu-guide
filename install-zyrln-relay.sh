@@ -14,6 +14,9 @@ readonly SERVICE_USER="zyrln"
 
 PORT="${ZYRLN_RELAY_PORT:-8787}"
 KEY="${ZYRLN_RELAY_KEY:-}"
+readonly APP_KEY_FILE="/etc/zyrln-app-key"
+APP_KEY="${ZYRLN_APP_KEY:-}"
+PUBLIC_HOST="${ZYRLN_PUBLIC_HOST:-}"
 TMP_DIR=""
 
 log() { printf '\n==> %s\n' "$*"; }
@@ -63,6 +66,40 @@ else
   KEY_WAS_GENERATED="no"
 fi
 [[ "$KEY" =~ ^[A-Za-z0-9._-]{32,128}$ ]] || die "Relay key must be 32-128 characters using only letters, digits, dot, underscore, or hyphen."
+
+# Keep a separate root-only copy of AUTH_KEY so reruns print the same
+# configuration. This secret is not passed to the relay service.
+if [[ -z "$APP_KEY" && -r "$APP_KEY_FILE" ]]; then
+  APP_KEY="$(cat "$APP_KEY_FILE")"
+fi
+if [[ -z "$APP_KEY" && -r /dev/tty ]]; then
+  printf 'Enter an Apps Script AUTH_KEY (leave blank to generate a new one): ' >/dev/tty
+  IFS= read -r -s APP_KEY </dev/tty || APP_KEY=""
+  printf '\n' >/dev/tty
+fi
+if [[ -z "$APP_KEY" ]]; then
+  APP_KEY="$(openssl rand -hex 32)"
+  APP_KEY_WAS_GENERATED="yes"
+else
+  APP_KEY_WAS_GENERATED="no"
+fi
+[[ "$APP_KEY" =~ ^[A-Za-z0-9._-]{32,128}$ ]] || die "Apps Script AUTH_KEY must be 32-128 characters using only letters, digits, dot, underscore, or hyphen."
+
+# Discover the public IPv4, or accept an explicit IPv4 address or DNS name.
+if [[ -z "$PUBLIC_HOST" ]]; then
+  PUBLIC_HOST="$(curl -4 --fail --silent --show-error --max-time 8 https://api.ipify.org 2>/dev/null || true)"
+fi
+if [[ -z "$PUBLIC_HOST" && -r /dev/tty ]]; then
+  printf 'Public IPv4 address or DNS name for this VPS: ' >/dev/tty
+  IFS= read -r PUBLIC_HOST </dev/tty || PUBLIC_HOST=""
+fi
+[[ "$PUBLIC_HOST" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]{0,251}[A-Za-z0-9])?$ ]] || die "Could not determine a valid public hostname. Set ZYRLN_PUBLIC_HOST or enter the public IPv4/DNS name."
+
+# Save AUTH_KEY separately with root-only permissions; the relay does not need it.
+install -o root -g root -m 0600 /dev/null "$APP_KEY_FILE"
+printf '%s\n' "$APP_KEY" > "$APP_KEY_FILE"
+chown root:root "$APP_KEY_FILE"
+chmod 0600 "$APP_KEY_FILE"
 
 log "Downloading the official Zyrln ${VERSION} VPS bundle"
 TMP_DIR="$(mktemp -d -t zyrln-install.XXXXXX)"
@@ -146,13 +183,18 @@ printf '\n============================================================\n'
 printf 'Zyrln VPS exit relay installed successfully (release %s)\n' "$VERSION"
 printf 'Service:             systemctl status zyrln-relay\n'
 printf 'Local health check:  curl http://127.0.0.1:%s/healthz\n' "$PORT"
-printf 'Public health check: curl http://YOUR_VPS_IP:%s/healthz\n' "$PORT"
-printf 'Apps Script relay:   http://YOUR_VPS_IP:%s/relay\n' "$PORT"
-printf 'Apps Script tunnel:  http://YOUR_VPS_IP:%s/tunnel\n' "$PORT"
-printf 'EXIT_RELAY_KEY:      %s\n' "$KEY"
+printf 'Public health check: curl http://%s:%s/healthz\n' "$PUBLIC_HOST" "$PORT"
+printf '\nCopy these four lines into the top of your Google Apps Script Code.gs:\n\n'
+printf 'const AUTH_KEY = "%s";\n' "$APP_KEY"
+printf 'const EXIT_RELAY_URL = "http://%s:%s/relay";\n' "$PUBLIC_HOST" "$PORT"
+printf 'const EXIT_TUNNEL_URL = "http://%s:%s/tunnel";\n' "$PUBLIC_HOST" "$PORT"
+printf 'const EXIT_RELAY_KEY = "%s";\n' "$KEY"
 printf '============================================================\n'
 printf 'IMPORTANT: Also allow inbound TCP %s in your VPS provider firewall.\n' "$PORT"
 printf 'The installer does not enable UFW automatically. Keep the key private.\n'
 if [[ "$KEY_WAS_GENERATED" == "yes" ]]; then
-  printf 'The key above was generated on this server; copy it to a password manager now.\n'
+  printf 'A new EXIT_RELAY_KEY was generated. Save the values above in a password manager.\n'
+fi
+if [[ "$APP_KEY_WAS_GENERATED" == "yes" ]]; then
+  printf 'A new AUTH_KEY was generated. Save the values above in a password manager.\n'
 fi

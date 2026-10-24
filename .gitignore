@@ -5,6 +5,7 @@
 *.key
 config.env
 zyrln-relay.env
+zyrln-app-key
 
 # Downloaded bundles and temporary files
 *.zip
