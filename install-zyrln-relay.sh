@@ -65,20 +65,23 @@ else
 fi
 
 # Do not replace another administrator's Caddy configuration or take occupied
-# public web ports. Existing configuration created by this script is reusable.
+# port 443. If port 80 is occupied, leave its service untouched and use TLS-ALPN.
 CADDY_WAS_INSTALLED="no"
 if dpkg-query -W -f='${Status}' caddy 2>/dev/null | grep -q 'install ok installed'; then
   CADDY_WAS_INSTALLED="yes"
 fi
+HTTP_PORT_AVAILABLE="yes"
 if [[ -e "$CADDYFILE" ]] && ! grep -Fq "$CADDY_MARKER" "$CADDYFILE"; then
   die "$CADDYFILE already exists and is not managed by this installer. Back it up and merge the HTTPS reverse_proxy configuration manually; the installer will not overwrite it."
 fi
 if command -v ss >/dev/null 2>&1 && ! systemctl is-active --quiet caddy 2>/dev/null; then
-  for p in 80 443; do
-    if ss -ltnH "sport = :${p}" 2>/dev/null | grep -q .; then
-      die "TCP port ${p} is already in use. Stop or reconfigure its service before installing HTTPS."
-    fi
-  done
+  if ss -ltnH 'sport = :80' 2>/dev/null | grep -q .; then
+    HTTP_PORT_AVAILABLE="no"
+    log "TCP port 80 is occupied; leaving its service untouched and using the TLS-ALPN challenge on 443 without HTTP redirects."
+  fi
+  if ss -ltnH 'sport = :443' 2>/dev/null | grep -q .; then
+    die "TCP port 443 is already in use. HTTPS cannot be served without coordinating with that service. Nothing listening on port 80 was changed."
+  fi
 fi
 
 log "Installing required utilities"
@@ -194,13 +197,28 @@ systemctl enable --now zyrln-relay.service
 systemctl restart zyrln-relay.service
 
 log "Configuring Caddy-managed HTTPS for ${HOST}"
+if [[ "$HTTP_PORT_AVAILABLE" == "no" ]]; then
+  cat > "$CADDYFILE" <<'CADDY'
+{
+    auto_https disable_redirects
+}
+
+CADDY
+fi
 if [[ "$IP_MODE" == "yes" ]]; then
-  cat > "$CADDYFILE" <<CADDY
+  cat >> "$CADDYFILE" <<CADDY
 ${CADDY_MARKER}
 ${HOST} {
     tls {
         issuer acme https://acme-v02.api.letsencrypt.org/directory {
             profile shortlived
+CADDY
+  if [[ "$HTTP_PORT_AVAILABLE" == "no" ]]; then
+    cat >> "$CADDYFILE" <<'CADDY'
+            disable_http_challenge
+CADDY
+  fi
+  cat >> "$CADDYFILE" <<CADDY
         }
     }
     encode zstd gzip
@@ -208,9 +226,20 @@ ${HOST} {
 }
 CADDY
 else
-  cat > "$CADDYFILE" <<CADDY
+  cat >> "$CADDYFILE" <<CADDY
 ${CADDY_MARKER}
 ${HOST} {
+CADDY
+  if [[ "$HTTP_PORT_AVAILABLE" == "no" ]]; then
+    cat >> "$CADDYFILE" <<'CADDY'
+    tls {
+        issuer acme {
+            disable_http_challenge
+        }
+    }
+CADDY
+  fi
+  cat >> "$CADDYFILE" <<CADDY
     encode zstd gzip
     reverse_proxy 127.0.0.1:${PORT}
 }
@@ -222,7 +251,9 @@ caddy validate --config "$CADDYFILE" --adapter caddyfile
 # Open standard HTTP/HTTPS ports only if the host firewall is already enabled.
 # Caddy redirects HTTP to HTTPS. The relay itself is bound to 127.0.0.1 only.
 if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q 'Status: active'; then
-  ufw allow 80/tcp || die "Could not open TCP 80 in UFW."
+  if [[ "$HTTP_PORT_AVAILABLE" == "yes" ]]; then
+    ufw allow 80/tcp || die "Could not open TCP 80 in UFW."
+  fi
   ufw allow 443/tcp || die "Could not open TCP 443 in UFW."
 fi
 
@@ -246,9 +277,9 @@ if [[ "$HEALTH_OK" != "yes" ]]; then
   systemctl --no-pager --full status zyrln-relay.service caddy.service || true
   journalctl -u caddy.service -n 80 --no-pager || true
   if [[ "$IP_MODE" == "yes" ]]; then
-    die "HTTPS health check failed. Confirm this public IPv4 belongs to the VPS and inbound TCP 80/443 are open in the provider firewall, then rerun the installer."
+    die "HTTPS health check failed. Confirm this public IPv4 belongs to the VPS and inbound TCP 443 is open in the provider firewall. If TCP 80 was free, also allow TCP 80. Then rerun the installer."
   fi
-  die "HTTPS health check failed. Confirm DNS A/AAAA points to this VPS and inbound TCP 80/443 are open in the provider firewall, then rerun the installer."
+  die "HTTPS health check failed. Confirm DNS A/AAAA points to this VPS and inbound TCP 443 is open in the provider firewall. If TCP 80 was free, also allow TCP 80. Then rerun the installer."
 fi
 
 printf '\n============================================================\n'
@@ -276,4 +307,9 @@ CADDY_VERSION="$(caddy version | awk 'NR == 1 { print $1 }' | sed 's/^v//')"
 if [[ "$IP_MODE" == "yes" ]]; then
   dpkg --compare-versions "$CADDY_VERSION" ge "2.11.7" \
     || die "Direct-IP certificates require Caddy 2.11.7 or newer. Installed version: ${CADDY_VERSION:-unknown}."
+fi
+if [[ "$HTTP_PORT_AVAILABLE" == "yes" ]]; then
+  printf 'Required provider firewall rules: inbound TCP 80 and TCP 443.\n'
+else
+  printf 'Required provider firewall rule: inbound TCP 443. Existing TCP 80 service was left untouched.\n'
 fi
