@@ -80,7 +80,12 @@ if command -v ss >/dev/null 2>&1 && ! systemctl is-active --quiet caddy 2>/dev/n
     log "TCP port 80 is occupied; leaving its service untouched and using the TLS-ALPN challenge on 443 without HTTP redirects."
   fi
   if ss -ltnH 'sport = :443' 2>/dev/null | grep -q .; then
-    die "TCP port 443 is already in use. HTTPS cannot be served without coordinating with that service. Nothing listening on port 80 was changed."
+    HTTPS_LISTENERS="$(ss -ltnp 'sport = :443' 2>/dev/null || true)"
+    [[ -n "$HTTPS_LISTENERS" ]] || HTTPS_LISTENERS="ss detected a listener, but it disappeared before process details could be read. Re-run the installer to check again."
+    die "TCP port 443 is already in use. Current listener details:
+${HTTPS_LISTENERS}
+
+Two independent services cannot bind the same address and TCP port. Sharing 443 requires configuring the existing TLS/HTTP proxy to route traffic to both services; this installer will not stop or rewrite the current service. Use a DNS hostname and configure hostname/SNI routing in that proxy, or free 443 through your own maintenance procedure. Nothing listening on port 80 was changed."
   fi
 fi
 
