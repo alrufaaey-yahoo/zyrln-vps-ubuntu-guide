@@ -32,7 +32,7 @@ sudo bash ~/install-zyrln-relay.sh
 sudo env ZYRLN_TRANSPORT=http ZYRLN_HTTP_PORT=8080 ZYRLN_CONFIRM_INSECURE_HTTP=yes bash ~/install-zyrln-relay.sh
 ```
 
-في التشغيل غير التفاعلي، يكون HTTPS هو الافتراضي ما لم تحدد `ZYRLN_TRANSPORT`. لا يسمح المثبّت بتشغيل HTTP غير التفاعلي إلا عند تمرير `ZYRLN_CONFIRM_INSECURE_HTTP=yes`.
+في التشغيل غير التفاعلي، يكون HTTP هو الافتراضي أيضًا حتى لا يسقط المثبّت بصمت إلى فحص 443 عند غياب الطرفية؛ لكنه يتوقف قبل التثبيت ما لم تمرر `ZYRLN_CONFIRM_INSECURE_HTTP=yes`. تظهر رسالة `Selected public transport` لتأكيد المسار المختار. لتشغيل HTTPS غير التفاعلي، مرّر `ZYRLN_TRANSPORT=https` صراحةً.
 
 يطلب المثبّت مفتاح الخروج `EXIT_RELAY_KEY` ومفتاح التطبيق `AUTH_KEY` بإدخال مخفي. اترك المطالبة فارغة لتوليد مفتاح عشوائي. في مرات التشغيل التالية، يعيد استخدام المفاتيح المحفوظة ما لم تمرر قيمًا جديدة عبر `ZYRLN_RELAY_KEY` أو `ZYRLN_APP_KEY`. لا تحفظ الأسرار في المستودع أو في سجل الأوامر.
 

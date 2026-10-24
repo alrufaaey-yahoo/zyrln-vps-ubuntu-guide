@@ -55,9 +55,12 @@ if [[ -z "$TRANSPORT" && -r /dev/tty ]]; then
     *) die "Choose 1/http or 2/https." ;;
   esac
 elif [[ -z "$TRANSPORT" ]]; then
-  TRANSPORT="https"
+  # Do not silently fall back to HTTPS when no controlling TTY is available.
+  # HTTP still requires explicit confirmation below before any changes.
+  TRANSPORT="http"
 fi
 [[ "$TRANSPORT" == "http" || "$TRANSPORT" == "https" ]] || die "ZYRLN_TRANSPORT must be http or https."
+log "Selected public transport: ${TRANSPORT^^}"
 
 if [[ "$TRANSPORT" == "http" ]]; then
   if [[ -z "$PUBLIC_HTTP_PORT" && -r /dev/tty ]]; then
