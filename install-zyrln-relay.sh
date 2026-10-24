@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Install/update the official Zyrln VPS exit relay on Ubuntu.
-# Pinned to the stable v2.0 release so the binary matches the documented setup.
+# Install/update the official Zyrln VPS relay behind Caddy-managed HTTPS.
+# Pinned to stable Zyrln v2.0. The public Apps Script URLs are HTTPS only.
 set -Eeuo pipefail
 IFS=$'\n\t'
 
@@ -9,14 +9,16 @@ readonly RELEASE_ASSET="zyrln-2.0-vps.zip"
 readonly RELEASE_URL="https://github.com/ajavadinezhad/zyrln/releases/download/${VERSION}/${RELEASE_ASSET}"
 readonly INSTALL_BIN="/usr/local/bin/zyrln-relay"
 readonly ENV_FILE="/etc/zyrln-relay.env"
+readonly APP_KEY_FILE="/etc/zyrln-app-key"
 readonly UNIT_FILE="/etc/systemd/system/zyrln-relay.service"
+readonly CADDYFILE="/etc/caddy/Caddyfile"
+readonly CADDY_MARKER="# Managed by install-zyrln-relay.sh"
 readonly SERVICE_USER="zyrln"
 
 PORT="${ZYRLN_RELAY_PORT:-8787}"
 KEY="${ZYRLN_RELAY_KEY:-}"
-readonly APP_KEY_FILE="/etc/zyrln-app-key"
 APP_KEY="${ZYRLN_APP_KEY:-}"
-PUBLIC_HOST="${ZYRLN_PUBLIC_HOST:-}"
+DOMAIN="${ZYRLN_DOMAIN:-${ZYRLN_PUBLIC_HOST:-}}"
 TMP_DIR=""
 
 log() { printf '\n==> %s\n' "$*"; }
@@ -43,19 +45,42 @@ esac
 
 [[ "$PORT" =~ ^[0-9]+$ ]] && (( PORT >= 1024 && PORT <= 65535 )) || die "ZYRLN_RELAY_PORT must be a TCP port from 1024 to 65535."
 
-log "Installing download and extraction utilities"
+# A publicly trusted certificate is issued for a DNS name in this installer.
+# The bare VPS IP must not be used as the public Apps Script endpoint.
+if [[ -z "$DOMAIN" && -r /dev/tty ]]; then
+  printf 'Public DNS name for HTTPS, e.g. relay.example.com: ' >/dev/tty
+  IFS= read -r DOMAIN </dev/tty || DOMAIN=""
+fi
+[[ "$DOMAIN" =~ ^([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,63}$ ]] || die "Set ZYRLN_DOMAIN to a public DNS name such as relay.example.com. A domain is required for this HTTPS setup."
+
+# Do not replace another administrator's Caddy configuration or take occupied
+# public web ports. Existing configuration created by this script is reusable.
+CADDY_WAS_INSTALLED="no"
+if dpkg-query -W -f='${Status}' caddy 2>/dev/null | grep -q 'install ok installed'; then
+  CADDY_WAS_INSTALLED="yes"
+fi
+if [[ -e "$CADDYFILE" ]] && ! grep -Fq "$CADDY_MARKER" "$CADDYFILE"; then
+  die "$CADDYFILE already exists and is not managed by this installer. Back it up and merge the HTTPS reverse_proxy configuration manually; the installer will not overwrite it."
+fi
+if command -v ss >/dev/null 2>&1 && ! systemctl is-active --quiet caddy 2>/dev/null; then
+  for p in 80 443; do
+    if ss -ltnH "sport = :${p}" 2>/dev/null | grep -q .; then
+      die "TCP port ${p} is already in use. Stop or reconfigure its service before installing HTTPS."
+    fi
+  done
+fi
+
+log "Installing required utilities"
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -y
-apt-get install -y ca-certificates curl unzip openssl
+apt-get install -y ca-certificates curl unzip openssl gnupg debian-keyring debian-archive-keyring apt-transport-https
 
-# Preserve an existing key on updates unless a new key was supplied.
+# Preserve existing relay/app keys on updates unless the operator supplied new ones.
 if [[ -z "$KEY" && -r "$ENV_FILE" ]]; then
   KEY="$(awk -F= '$1 == "ZYRLN_RELAY_KEY" { sub(/^[^=]*=/, ""); print; exit }' "$ENV_FILE")"
 fi
-
-# On first install, accept a key through a hidden prompt or generate one.
-if [[ -z "$KEY" && ! -e "$ENV_FILE" && -r /dev/tty ]]; then
-  printf 'Enter an exit-relay key (leave blank to generate a secure random key): ' >/dev/tty
+if [[ -z "$KEY" && -r /dev/tty ]]; then
+  printf 'Exit-relay key (leave blank to reuse/generate): ' >/dev/tty
   IFS= read -r -s KEY </dev/tty || KEY=""
   printf '\n' >/dev/tty
 fi
@@ -65,15 +90,13 @@ if [[ -z "$KEY" ]]; then
 else
   KEY_WAS_GENERATED="no"
 fi
-[[ "$KEY" =~ ^[A-Za-z0-9._-]{32,128}$ ]] || die "Relay key must be 32-128 characters using only letters, digits, dot, underscore, or hyphen."
+[[ "$KEY" =~ ^[A-Za-z0-9._-]{32,128}$ ]] || die "EXIT_RELAY_KEY must be 32-128 characters using only letters, digits, dot, underscore, or hyphen."
 
-# Keep a separate root-only copy of AUTH_KEY so reruns print the same
-# configuration. This secret is not passed to the relay service.
 if [[ -z "$APP_KEY" && -r "$APP_KEY_FILE" ]]; then
   APP_KEY="$(cat "$APP_KEY_FILE")"
 fi
 if [[ -z "$APP_KEY" && -r /dev/tty ]]; then
-  printf 'Enter an Apps Script AUTH_KEY (leave blank to generate a new one): ' >/dev/tty
+  printf 'Apps Script AUTH_KEY (leave blank to reuse/generate): ' >/dev/tty
   IFS= read -r -s APP_KEY </dev/tty || APP_KEY=""
   printf '\n' >/dev/tty
 fi
@@ -83,29 +106,26 @@ if [[ -z "$APP_KEY" ]]; then
 else
   APP_KEY_WAS_GENERATED="no"
 fi
-[[ "$APP_KEY" =~ ^[A-Za-z0-9._-]{32,128}$ ]] || die "Apps Script AUTH_KEY must be 32-128 characters using only letters, digits, dot, underscore, or hyphen."
+[[ "$APP_KEY" =~ ^[A-Za-z0-9._-]{32,128}$ ]] || die "AUTH_KEY must be 32-128 characters using only letters, digits, dot, underscore, or hyphen."
 
-# Discover the public IPv4, or accept an explicit IPv4 address or DNS name.
-if [[ -z "$PUBLIC_HOST" ]]; then
-  PUBLIC_HOST="$(curl -4 --fail --silent --show-error --max-time 8 https://api.ipify.org 2>/dev/null || true)"
+# Install Caddy from its official stable Debian/Ubuntu package repository.
+if [[ "$CADDY_WAS_INSTALLED" != "yes" ]]; then
+  log "Adding the official Caddy stable package repository"
+  install -d -m 0755 /usr/share/keyrings
+  curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' \
+    | gpg --dearmor --yes -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
+  curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' \
+    | tee /etc/apt/sources.list.d/caddy-stable.list >/dev/null
+  chmod o+r /usr/share/keyrings/caddy-stable-archive-keyring.gpg /etc/apt/sources.list.d/caddy-stable.list
+  apt-get update -y
+  apt-get install -y caddy
 fi
-if [[ -z "$PUBLIC_HOST" && -r /dev/tty ]]; then
-  printf 'Public IPv4 address or DNS name for this VPS: ' >/dev/tty
-  IFS= read -r PUBLIC_HOST </dev/tty || PUBLIC_HOST=""
-fi
-[[ "$PUBLIC_HOST" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]{0,251}[A-Za-z0-9])?$ ]] || die "Could not determine a valid public hostname. Set ZYRLN_PUBLIC_HOST or enter the public IPv4/DNS name."
-
-# Save AUTH_KEY separately with root-only permissions; the relay does not need it.
-install -o root -g root -m 0600 /dev/null "$APP_KEY_FILE"
-printf '%s\n' "$APP_KEY" > "$APP_KEY_FILE"
-chown root:root "$APP_KEY_FILE"
-chmod 0600 "$APP_KEY_FILE"
+command -v caddy >/dev/null 2>&1 || die "Caddy installation did not provide the caddy command."
 
 log "Downloading the official Zyrln ${VERSION} VPS bundle"
 TMP_DIR="$(mktemp -d -t zyrln-install.XXXXXX)"
 curl --fail --location --silent --show-error --retry 3 --retry-delay 2 \
   "$RELEASE_URL" -o "$TMP_DIR/$RELEASE_ASSET"
-
 BINARY_MEMBER="zyrln-relay-linux-${ARCH}"
 unzip -Z1 "$TMP_DIR/$RELEASE_ASSET" | grep -Fxq "$BINARY_MEMBER" || die "Expected binary $BINARY_MEMBER is missing from the official release bundle."
 unzip -p "$TMP_DIR/$RELEASE_ASSET" "$BINARY_MEMBER" > "$TMP_DIR/zyrln-relay"
@@ -118,13 +138,17 @@ if ! id "$SERVICE_USER" >/dev/null 2>&1; then
   useradd --system --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin "$SERVICE_USER"
 fi
 
-log "Writing protected relay configuration"
+log "Saving secrets separately with restricted permissions"
 install -o root -g "$SERVICE_USER" -m 0640 /dev/null "$ENV_FILE"
-printf 'ZYRLN_RELAY_LISTEN=0.0.0.0:%s\nZYRLN_RELAY_KEY=%s\n' "$PORT" "$KEY" > "$ENV_FILE"
+printf 'ZYRLN_RELAY_LISTEN=127.0.0.1:%s\nZYRLN_RELAY_KEY=%s\n' "$PORT" "$KEY" > "$ENV_FILE"
 chown root:"$SERVICE_USER" "$ENV_FILE"
 chmod 0640 "$ENV_FILE"
+install -o root -g root -m 0600 /dev/null "$APP_KEY_FILE"
+printf '%s\n' "$APP_KEY" > "$APP_KEY_FILE"
+chown root:root "$APP_KEY_FILE"
+chmod 0600 "$APP_KEY_FILE"
 
-log "Installing systemd unit"
+log "Installing the Zyrln systemd service on loopback only"
 cat > "$UNIT_FILE" <<UNIT
 [Unit]
 Description=Zyrln Exit Relay
@@ -158,40 +182,61 @@ systemctl daemon-reload
 systemctl enable --now zyrln-relay.service
 systemctl restart zyrln-relay.service
 
-# Add a host firewall rule only when UFW is already active. Do not enable UFW
-# automatically, because that can lock out a remote administrator.
+log "Configuring Caddy-managed HTTPS for ${DOMAIN}"
+cat > "$CADDYFILE" <<CADDY
+${CADDY_MARKER}
+${DOMAIN} {
+    encode zstd gzip
+    reverse_proxy 127.0.0.1:${PORT}
+}
+CADDY
+chmod 0644 "$CADDYFILE"
+caddy validate --config "$CADDYFILE" --adapter caddyfile
+
+# Open standard HTTP/HTTPS ports only if the host firewall is already enabled.
+# Caddy redirects HTTP to HTTPS. The relay itself is bound to 127.0.0.1 only.
 if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q 'Status: active'; then
-  ufw allow "${PORT}/tcp" || die "Could not open TCP ${PORT} in UFW."
+  ufw allow 80/tcp || die "Could not open TCP 80 in UFW."
+  ufw allow 443/tcp || die "Could not open TCP 443 in UFW."
 fi
 
-log "Checking the local health endpoint"
+systemctl enable caddy
+if systemctl is-active --quiet caddy; then
+  systemctl reload caddy
+else
+  systemctl start caddy
+fi
+
+log "Waiting for Caddy to obtain a trusted certificate and serve HTTPS"
 HEALTH_OK="no"
-for _ in {1..15}; do
-  if curl --fail --silent --show-error "http://127.0.0.1:${PORT}/healthz" >/dev/null 2>&1; then
+for _ in {1..60}; do
+  if curl --fail --silent --show-error --connect-timeout 4 "https://${DOMAIN}/healthz" >/dev/null 2>&1; then
     HEALTH_OK="yes"
     break
   fi
-  sleep 1
+  sleep 2
 done
 if [[ "$HEALTH_OK" != "yes" ]]; then
-  systemctl --no-pager --full status zyrln-relay.service || true
-  journalctl -u zyrln-relay.service -n 50 --no-pager || true
-  die "Health check failed. See the service logs above."
+  systemctl --no-pager --full status zyrln-relay.service caddy.service || true
+  journalctl -u caddy.service -n 80 --no-pager || true
+  die "HTTPS health check failed. Confirm DNS A/AAAA points to this VPS and inbound TCP 80/443 are open in the provider firewall, then rerun the installer."
 fi
 
 printf '\n============================================================\n'
-printf 'Zyrln VPS exit relay installed successfully (release %s)\n' "$VERSION"
-printf 'Service:             systemctl status zyrln-relay\n'
-printf 'Local health check:  curl http://127.0.0.1:%s/healthz\n' "$PORT"
-printf 'Public health check: curl http://%s:%s/healthz\n' "$PUBLIC_HOST" "$PORT"
-printf '\nCopy these four lines into the top of your Google Apps Script Code.gs:\n\n'
+printf 'Zyrln VPS relay installed with HTTPS (release %s)\n' "$VERSION"
+printf 'Domain:              https://%s\n' "$DOMAIN"
+printf 'Relay service:       systemctl status zyrln-relay\n'
+printf 'Caddy service:       systemctl status caddy\n'
+printf 'HTTPS health check:  curl https://%s/healthz\n' "$DOMAIN"
+printf '\nCopy these four lines into the top of Google Apps Script Code.gs:\n\n'
 printf 'const AUTH_KEY = "%s";\n' "$APP_KEY"
-printf 'const EXIT_RELAY_URL = "http://%s:%s/relay";\n' "$PUBLIC_HOST" "$PORT"
-printf 'const EXIT_TUNNEL_URL = "http://%s:%s/tunnel";\n' "$PUBLIC_HOST" "$PORT"
+printf 'const EXIT_RELAY_URL = "https://%s/relay";\n' "$DOMAIN"
+printf 'const EXIT_TUNNEL_URL = "https://%s/tunnel";\n' "$DOMAIN"
 printf 'const EXIT_RELAY_KEY = "%s";\n' "$KEY"
 printf '============================================================\n'
-printf 'IMPORTANT: Also allow inbound TCP %s in your VPS provider firewall.\n' "$PORT"
-printf 'The installer does not enable UFW automatically. Keep the key private.\n'
+printf 'Required provider firewall rules: inbound TCP 80 and TCP 443.\n'
+printf 'The Zyrln relay listens on 127.0.0.1:%s only; do not expose port %s publicly.\n' "$PORT" "$PORT"
+printf 'Keep the printed keys private. HTTP on the domain is redirected to HTTPS by Caddy.\n'
 if [[ "$KEY_WAS_GENERATED" == "yes" ]]; then
   printf 'A new EXIT_RELAY_KEY was generated. Save the values above in a password manager.\n'
 fi

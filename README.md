@@ -1,41 +1,27 @@
-# تثبيت مرحّل Zyrln على VPS Ubuntu واستخدامه على Android
+# تثبيت مرحّل Zyrln على VPS Ubuntu مع HTTPS واستخدامه على Android
 
-يحتوي هذا المستودع على مثبت Bash مستقل ودليل عربي لإعداد **مرحّل خروج Zyrln** على VPS يعمل بـUbuntu، ثم ربطه بتطبيق Android عبر Google Apps Script.
+يحتوي هذا المستودع على مثبت Bash مستقل ودليل عربي لإعداد **مرحّل خروج Zyrln** على VPS Ubuntu، وتأمين الواجهة العامة عبر Caddy وشهادة TLS تلقائية، ثم ربطه بتطبيق Android عبر Google Apps Script.
 
-> **تنبيه:** المثبت يجهّز جزء الـVPS فقط. لا ينشر Google Apps Script نيابةً عنك، ولا يثبت APK على الهاتف؛ يلزم إكمال هذين الجزأين من حساب Google وهاتف Android الخاصين بك.
+> **المثبت لا يطبع عناوين Apps Script بـHTTP.** يحتاج الإعداد إلى نطاق DNS عام مثل `relay.example.com` يشير إلى VPS. يستقبل Caddy الاتصالات العامة عبر HTTPS على 443، ويحوّلها داخليًا إلى خدمة Zyrln على `127.0.0.1`. المنفذ 8787 لا يُعرض مباشرة على الإنترنت.
 
 ## الملفات
 
-- [`install-zyrln-relay.sh`](install-zyrln-relay.sh): تنزيل ثنائية Zyrln الرسمية وإعداد الخدمة واختبارها، ثم طباعة ثوابت Apps Script النهائية.
-- [`README.md`](README.md): خطوات التثبيت والتكوين والصيانة واستكشاف الأعطال.
+- [`install-zyrln-relay.sh`](install-zyrln-relay.sh): مثبت HTTPS ينزّل إصدار Zyrln الرسمي، يجهّز Caddy، يقيّد الخدمة إلى loopback، ويطبع الثوابت الأربع النهائية.
+- [`README.md`](README.md): خطوات DNS والتثبيت والنشر والأمان واستكشاف الأعطال.
 
-## مسار الاتصال
+## المتطلبات قبل تشغيل المثبت
 
-```text
-Android Zyrln VPN
-  │ عنوان Apps Script + AUTH_KEY
-  ▼
-Google Apps Script Web App
-  │ EXIT_RELAY_URL + EXIT_RELAY_KEY
-  ▼
-Zyrln relay على VPS Ubuntu، TCP 8787
-  ▼
-الموقع المقصود
-```
+1. امتلك اسم نطاق أو نطاقًا فرعيًا عامًا، مثل `relay.example.com`.
+2. أنشئ سجل DNS من النوع `A` يشير إلى IPv4 العام للـVPS. أضف سجل `AAAA` فقط إذا كان عنوان IPv6 يصل إلى الخادم ويُسمح على المنافذ المطلوبة.
+3. افتح **TCP 80 وTCP 443** في لوحة مزوّد VPS. يستخدم Caddy هذين المنفذين للحصول على الشهادة وخدمة HTTPS والتحويل من HTTP إلى HTTPS. لن يعمل إصدار الشهادة إذا لم يصل النطاق إلى الخادم أو كانت المنافذ محجوبة.[1] [2]
+4. استخدم Ubuntu مع systemd وصلاحية root أو sudo. يدعم المثبت `amd64` و`arm64`.
+5. حساب Google لنشر Apps Script Web App، وهاتف Android لتثبيت التطبيق.
 
-لا تدخل عنوان الـVPS في حقل URL داخل تطبيق Android. التطبيق يستخدم عنوان Web App الخاص بـGoogle والمنتهي بـ`/exec` ومفتاح التطبيق فقط. مفتاح الخروج يُستخدم بين Apps Script والخادم.[1]
+لا تستخدم عنوان IP وحده في إعدادات `EXIT_RELAY_URL` في هذا المثبت؛ يلزم hostname DNS عام يستطيع Caddy الحصول على شهادة موثوقة له. إذا كانت المنافذ 80/443 مستخدمة من موقع آخر أو كان هناك Caddyfile غير تابع لهذا المثبت، يتوقف المثبت بدل استبدال إعداد الموقع الموجود.
 
-## المتطلبات
+## تنزيل المثبت وتشغيله
 
-- VPS بعنوان IP عام، يعمل بنظام Ubuntu وsystemd، ومعمارية `amd64` أو `arm64`.
-- صلاحية `root` أو حساب يملك `sudo`.
-- اتصال صادر بالإنترنت لتنزيل ملف GitHub الرسمي والوصول إلى المواقع المطلوبة.
-- سماح **Inbound TCP 8787** في جدار مزوّد VPS. إذا كان UFW مفعّلًا مسبقًا، يضيف المثبت قاعدة لهذا المنفذ. لا يفعّل UFW تلقائيًا حتى لا يقطع وصول SSH.
-- حساب Google يستطيع نشر Apps Script Web App بصلاحية `Anyone`، وهاتف Android لتثبيت التطبيق.
-
-## 1. تنزيل السكربت وتشغيله
-
-نزّل `install-zyrln-relay.sh` من المستودع الخاص بعد تسجيل الدخول إلى GitHub، ثم انقله إلى الـVPS عبر SCP أو أداة نقل ملفات موثوقة. مثال من جهازك:
+نزّل `install-zyrln-relay.sh` من المستودع الخاص بعد تسجيل الدخول إلى GitHub، وانقله عبر SCP إلى الخادم. مثال:
 
 ```bash
 scp ./install-zyrln-relay.sh ubuntu@YOUR_VPS_IP:~/install-zyrln-relay.sh
@@ -49,39 +35,32 @@ chmod 700 ~/install-zyrln-relay.sh
 sudo bash ~/install-zyrln-relay.sh
 ```
 
-### ما الذي يفعله المثبت؟
+أدخل hostname مثل `relay.example.com` عند المطالبة. يطلب المثبت كذلك مفتاح خروج `EXIT_RELAY_KEY` ومفتاح تطبيق `AUTH_KEY` بإدخال مخفي. اترك أي مطالبة سرية فارغة إذا أردت توليد مفتاح عشوائي؛ عند إعادة تشغيل المثبت، المفاتيح المحفوظة تُعاد استخدامها ما لم تمرر قيمًا جديدة.
 
-المثبت مثبت على إصدار المشروع المستقر **v2.0** لضمان توافق المرحّل مع خطوات Apps Script وAndroid في هذا الدليل. يتحقق من Ubuntu وsystemd ومعمارية الجهاز، ثم ينزّل حزمة VPS الرسمية عبر HTTPS، ويستخرج الملف التنفيذي المناسب، وينشئ مستخدم خدمة محدود الصلاحيات باسم `zyrln`، ويشغّل الخدمة عبر systemd لتبدأ تلقائيًا بعد إعادة تشغيل الخادم.
+يمكن تحديد النطاق دون مطالبة تفاعلية عبر المتغير `ZYRLN_DOMAIN`. كما يمكن تحديد مفاتيحك عبر `ZYRLN_APP_KEY` و`ZYRLN_RELAY_KEY`، والمنفذ المحلي عبر `ZYRLN_RELAY_PORT`. لا تضع الأسرار في سطر أوامر أو سجل طرفية إن أمكن؛ الإدخال المخفي أسلم.
 
-يطالبك بإدخال **مفتاح الخروج** `EXIT_RELAY_KEY` و**مفتاح التطبيق** `AUTH_KEY` بشكل مخفي. إذا تركت قيمة أحدهما فارغة، ينشئ المثبت مفتاحًا عشوائيًا قويًا. كما يحاول اكتشاف IPv4 العام للخادم تلقائيًا. إذا تعذّر ذلك، يطلب عنوان IP العام أو اسم DNS؛ ويمكن تحديده مسبقًا بالمتغير `ZYRLN_PUBLIC_HOST`.
+## ما الذي يقوم به المثبت؟
 
-بعد التثبيت، يطبع المثبت كتلة الثوابت الأربع كاملة وجاهزة للنسخ إلى أعلى ملف `Code.gs`:
+المثبت مثبت على إصدار Zyrln المستقر **v2.0**. يتحقق من Ubuntu وsystemd والمعمارية، ثم ينزّل حزمة VPS الرسمية عبر HTTPS. يثبت Caddy من مستودعه الرسمي، وينشئ خدمة systemd لمرحّل Zyrln تحت مستخدم محدود باسم `zyrln`.[3]
+
+يُضبط المرحّل ليستمع إلى `127.0.0.1:8787` فقط، وليس إلى كل واجهات الشبكة. يضيف Caddy وكيلًا عكسيًا للنطاق الذي أدخلته. يحصل Caddy تلقائيًا على شهادة TLS عامة ويجددها، ويعيد توجيه طلبات HTTP للنطاق إلى HTTPS.[1] [2]
+
+يحفظ مفتاح الخروج في `/etc/zyrln-relay.env` بصلاحيات مقيدة. ويحفظ مفتاح التطبيق منفصلًا في `/etc/zyrln-app-key` بصلاحية root فقط؛ خدمة relay لا تحتاج إلى هذا المفتاح. بعد نجاح فحص `https://DOMAIN/healthz` يطبع القيم الأربع بهذه الصيغة:
 
 ```js
-const AUTH_KEY = "المفتاح_الذي_أدخلته_أو_ولّده_المثبت";
-const EXIT_RELAY_URL = "http://عنوان_VPS_العام:8787/relay";
-const EXIT_TUNNEL_URL = "http://عنوان_VPS_العام:8787/tunnel";
-const EXIT_RELAY_KEY = "مفتاح_الخروج_الذي_أدخلته_أو_ولّده_المثبت";
+const AUTH_KEY = "المفتاح_الذي_أدخلته_أو_ولده_المثبت";
+const EXIT_RELAY_URL = "https://relay.example.com/relay";
+const EXIT_TUNNEL_URL = "https://relay.example.com/tunnel";
+const EXIT_RELAY_KEY = "مفتاح_الخروج_الذي_أدخلته_أو_ولده_المثبت";
 ```
 
-انسخ القيم الحقيقية التي يطبعها الطرفية؛ المثال أعلاه للتوضيح فقط. يخزن المثبت مفتاح الخروج في `/etc/zyrln-relay.env` بصلاحيات `0640`، ويحفظ مفتاح التطبيق منفصلًا في `/etc/zyrln-app-key` بصلاحيات `0600` للـroot فقط. لا يحتاج برنامج المرحّل إلى مفتاح التطبيق. **لا تضف القيم المطبوعة إلى GitHub أو إلى ملف عام.**
+انسخ القيم الفعلية التي يطبعها السكربت إلى أعلى `Code.gs`. احفظها في مدير كلمات مرور. **لا ترفع المفاتيح إلى GitHub حتى لو كان المستودع خاصًا.**
 
-إذا كان لديك Apps Script قائم وتريد إبقاء `AUTH_KEY` المستخدم حاليًا، أدخله عند مطالبة المثبت بدل ترك الحقل فارغًا. وإذا تركت المطالبة فارغة، سينشئ مفتاحًا جديدًا؛ يجب حينها تحديث Apps Script وإعداد Android بالقيم الجديدة.
+إذا لم ينجح فحص HTTPS، يتوقف المثبت مع رسالة تحقق من DNS والمنافذ وسجل Caddy بدل أن يعرض إعدادًا نهائيًا بـHTTP. بعد إصلاح السبب، أعد تشغيله؛ يحافظ على المفاتيح المحفوظة.
 
-### إعادة التشغيل أو تحديث المثبت
+## الجدار الناري
 
-يمكنك تشغيل السكربت نفسه مرة أخرى لتحديث ثنائية الإصدار المثبت أو إعادة إنشاء وحدة الخدمة. إذا تركت مطالبة كل مفتاح فارغة، يقرأ المثبت المفتاح المحفوظ ويعيد طباعة نفس الثوابت. استرجع القيم يدويًا عند الحاجة بصلاحيات root، ولا تشارك ناتجها:
-
-```bash
-sudo grep '^ZYRLN_RELAY_KEY=' /etc/zyrln-relay.env
-sudo cat /etc/zyrln-app-key
-```
-
-لأتمتة التثبيت يمكن تمرير `ZYRLN_APP_KEY` و`ZYRLN_RELAY_KEY` و`ZYRLN_RELAY_PORT` و`ZYRLN_PUBLIC_HOST` كمتغيرات بيئة. لا تضع سرًا في سطر أمر إذا كان ذلك سيحفظه بسجل الطرفية أو يعرضه في قائمة العمليات؛ الإدخال المخفي هو الخيار المناسب عادةً.
-
-## 2. افتح المنفذ في لوحة مزوّد VPS
-
-من لوحة مزوّد الخادم، أضف قاعدة **Inbound TCP 8787**. جدار الشبكة لدى المزوّد مستقل عن UFW داخل Ubuntu. لا تفعّل UFW عن بُعد قبل السماح بمنفذ SSH الصحيح حتى لا تفقد الوصول إلى الخادم.[2]
+في لوحة مزوّد VPS افتح TCP 80 و443. إذا كان UFW مفعّلًا، يضيف المثبت القاعدتين. لا يفعّل UFW تلقائيًا حتى لا يقطع SSH. لا تحتاج إلى فتح 8787 للإنترنت؛ المرحّل مربوط على loopback.[4]
 
 تحقق من UFW:
 
@@ -89,114 +68,64 @@ sudo cat /etc/zyrln-app-key
 sudo ufw status
 ```
 
-إذا كان فعالًا ولم يضف المثبت القاعدة:
+إذا كان مفعّلًا ولم تضاف القواعد:
 
 ```bash
-sudo ufw allow 8787/tcp
+sudo ufw allow 80/tcp
+sudo ufw allow 443/tcp
 ```
 
-فتح المنفذ في لوحة المزوّد مطلوب حتى لو كانت قاعدة UFW موجودة.
+إذا سبق أن فتحت TCP 8787 في لوحة المزوّد أو UFW للمرحّل القديم، أزل تلك القاعدة. الخدمة الجديدة لا تستمع على العنوان العام في ذلك المنفذ.
 
-## 3. تحقق من الخدمة
+## إنشاء Google Apps Script
 
-على VPS:
+1. افتح [script.google.com](https://script.google.com) وأنشئ مشروعًا جديدًا.
+2. انسخ محتوى [`Code.gs` الرسمي المطابق للإصدار v2.0](https://github.com/ajavadinezhad/zyrln/blob/v2.0/relay/deploy/apps-script/Code.gs) إلى محرر المشروع.
+3. الصق الثوابت الأربع التي طبعها المثبت في بداية `Code.gs` بدل الثوابت النموذجية. تأكد من بقاء بقية الكود كما هو. يجب أن يبدأ `EXIT_RELAY_URL` و`EXIT_TUNNEL_URL` بـ`https://`.
+4. اختر **Deploy → New deployment → Web app**.
+5. عيّن **Execute as: Me** و**Who has access: Anyone**، ثم اضغط **Deploy** ووافق على أذونات Google.
+6. احتفظ برابط Google المنشور الذي ينتهي بـ`/exec`. هذا هو الرابط الذي يوضع في تطبيق Android؛ ليس رابط نطاق VPS.
+
+بعد أي تعديل على `Code.gs` اذهب إلى **Deploy → Manage deployments → Edit → New version → Deploy**. حفظ الملف وحده لا يغيّر النسخة المنشورة. إذا لم يسمح حساب Workspace بخيار `Anyone`، يجب تعديل سياسة المؤسسة أو استخدام حساب مسموح.[5]
+
+## إعداد Android
+
+1. نزّل APK الرسمي من صفحة [إصدار v2.0](https://github.com/ajavadinezhad/zyrln/releases/tag/v2.0)، واختر الملف المنتهي بـ`-android.apk`.
+2. ثبّت التطبيق واسمح مؤقتًا لمصدر التثبيت إذا طلب Android ذلك.
+3. أضف ملف اتصال: في URL ضع رابط Apps Script المنشور المنتهي بـ`/exec`. في Key ضع `AUTH_KEY` من الكتلة المطبوعة.
+4. اضغط **Connect** ووافق على طلب Android لإنشاء VPN.
+5. اختبر فتح موقع فعلي. نجاح فحص `/healthz` لا يثبت وحده أن Apps Script وإعداد التطبيق صحيحان. نفق Android في v2.0 TCP فقط؛ قد لا تعمل مكالمات أو وظائف UDP.[6]
+
+## التحقق والصيانة
 
 ```bash
 sudo systemctl status zyrln-relay --no-pager
-curl -i http://127.0.0.1:8787/healthz
-```
-
-ومن جهاز آخر على الإنترنت:
-
-```bash
-curl -i http://YOUR_VPS_IP:8787/healthz
-```
-
-الاستجابة المتوقعة `HTTP 200` ومتن النص `ok`. هذا يختبر وصول الشبكة إلى المرحّل فقط، ولا يثبت أن Google Apps Script أو Android أُعدّا.[1]
-
-أوامر إدارة وتشخيص:
-
-```bash
-sudo systemctl restart zyrln-relay
-sudo systemctl stop zyrln-relay
-sudo systemctl start zyrln-relay
+sudo systemctl status caddy --no-pager
+curl -i https://YOUR_DOMAIN/healthz
 sudo journalctl -u zyrln-relay -n 100 --no-pager
-sudo ss -lntp | grep ':8787'
+sudo journalctl -u caddy -n 100 --no-pager
+sudo ss -lntp | grep -E ':(80|443|8787)'
 ```
 
-## 4. إنشاء Google Apps Script
+النتيجة المتوقعة: HTTPS يعيد `HTTP 200` و`ok`. يفترض أن يظهر Zyrln على `127.0.0.1:8787` فقط، وCaddy على المنافذ العامة 80 و443.
 
-1. افتح [script.google.com](https://script.google.com) وأنشئ مشروعًا جديدًا.
-2. انسخ محتوى [`Code.gs` الرسمي المطابق للإصدار v2.0](https://github.com/ajavadinezhad/zyrln/blob/v2.0/relay/deploy/apps-script/Code.gs) كاملًا إلى محرر المشروع.
-3. الصق كتلة الثوابت الأربع التي طبعها المثبت في بداية `Code.gs` بدل القيم النموذجية. تأكد من بقاء بقية الكود كما هو.
-4. اختر **Deploy → New deployment → Web app**.
-5. اختر **Execute as: Me** و**Who has access: Anyone**، ثم **Deploy** ووافق على أذونات Google.
-6. انسخ رابط النشر الذي ينتهي بـ`/exec`.
-
-إذا عدّلت `Code.gs` بعد النشر، اذهب إلى **Deploy → Manage deployments → Edit → New version → Deploy**. حفظ الملف وحده لا يحدّث النسخة المنشورة. إذا منع حساب Google Workspace خيار `Anyone`، تحقق من سياسة المؤسسة أو استخدم حسابًا يسمح بهذا الإعداد.[3]
-
-## 5. إعداد Android
-
-1. نزّل APK الرسمي من صفحة [إصدار v2.0](https://github.com/ajavadinezhad/zyrln/releases/tag/v2.0)، واختر الملف المنتهي بـ`-android.apk`.
-2. ثبّت التطبيق. إذا طلب Android السماح بالتثبيت من هذا المصدر، اسمح به للمتصفح أو مدير الملفات الذي فتح APK.
-3. أضف ملف اتصال. أدخل رابط Google Apps Script المنتهي بـ`/exec` في خانة URL، واستخدم قيمة `AUTH_KEY` المطبوعة في خانة key.
-4. اضغط **Connect** ووافق على طلب Android لإنشاء اتصال VPN.
-5. افتح موقعًا فعليًا للاختبار. نجاح Ping وحده لا يكفي. لتغيير **Split tunnel** افصل الاتصال أولًا.[4]
-
-شكل إعداد التطبيق يكون مثل:
-
-```json
-{"url":"https://script.google.com/macros/s/DEPLOYMENT_ID/exec","key":"قيمة_AUTH_KEY_المطبوعة"}
-```
-
-لا تستخدم عنوان VPS أو مفتاح الخروج في تطبيق Android. تعامل مع JSON على أنه سر؛ من يحصل عليه قد يستخدم relay وحصة Apps Script.[1] [4]
-
-## 6. قائمة فحص إذا لم يعمل
-
-1. `systemctl status zyrln-relay` يظهر `active (running)`.
-2. `/healthz` يعمل محليًا ومن جهاز خارجي.
-3. `8787/TCP` مسموح في جدار مزود VPS وUFW إذا كان فعالًا.
-4. عناوين `EXIT_RELAY_URL` و`EXIT_TUNNEL_URL` تستخدم المضيف والمنفذ والمسارين الصحيحين.
-5. `EXIT_RELAY_KEY` في Apps Script يطابق مفتاح الخروج المحفوظ على الخادم.
-6. `AUTH_KEY` في Apps Script يطابق المفتاح الذي تستخدمه في Android.
-7. رابط Android هو عنوان Web App المنشور والمنتهي بـ`/exec`، وليس `/dev` أو عنوان VPS.
-8. آخر تعديل على Apps Script منشور كـ**New version**.
-9. أوقف أي VPN آخر مؤقتًا إذا كان يتعارض مع Zyrln.
-
-## 7. الأمان والقيود
-
-- لا تحفظ المفاتيح أو إعداد الاتصال في هذا المستودع، حتى لو كان Private.
-- العناوين الافتراضية تستخدم `http://` بين Google Apps Script والـVPS؛ هذا الجزء ليس مشفرًا بواسطة TLS افتراضيًا. لحمايته، جهّز Reverse Proxy وشهادة TLS أولًا، وبعدها غيّر العنوانين إلى HTTPS. لا تغيّر الروابط قبل إعداد TLS والتحقق منه.
-- يعمل المرحّل تحت مستخدم نظامي محدود الصلاحيات. لا تشارك المفاتيح، ودوّرها إذا اشتبهت بتسريبها.
-- نفق Android في v2.0 يمرر TCP فقط، ولا يمرر UDP؛ لذلك قد لا تعمل المكالمات أو بعض وظائف التطبيقات.[1]
-- استجابة `ok` من `/healthz` لا تؤكد نجاح السلسلة كاملة.
-
-## تدوير المفاتيح
-
-للتغيير اليدوي لمفتاح الخروج، عدّل الملف:
-
-```bash
-sudoedit /etc/zyrln-relay.env
-sudo systemctl restart zyrln-relay
-```
-
-ثم حدّث `EXIT_RELAY_KEY` في Apps Script وانشر **New version**. مفتاح التطبيق محفوظ منفصلًا في `/etc/zyrln-app-key`. إذا غيّرته يدويًا، استخدم مفتاحًا جديدًا بطول 32 محرفًا على الأقل، ثم حدّث `AUTH_KEY` في Apps Script وإعداد Android.
+لتغيير النطاق، مرّر `ZYRLN_DOMAIN` عند إعادة تشغيل المثبت بعد إعداد DNS، أو غيّر Caddyfile يدويًا بعناية. لتدوير مفتاح الخروج، حدّث `/etc/zyrln-relay.env` ثم أعد تشغيل Zyrln، وعدّل `EXIT_RELAY_KEY` في Apps Script وانشر New version. مفتاح التطبيق محفوظ منفصلًا في `/etc/zyrln-app-key`.
 
 ## استكشاف الأخطاء
 
-**فشل تنزيل حزمة GitHub:** افحص DNS والإنترنت الصادر من الخادم، ثم أعد التشغيل. المثبت ينزّل حزمة VPS الرسمية ويستخرج منها الملف التنفيذي، ولا ينفّذ سكربت shell عشوائيًا عن بُعد.
+**Caddy لا يحصل على شهادة:** تحقق من سجل DNS `A`/`AAAA`، ومن أن المنافذ TCP 80 و443 تصل إلى هذا الخادم من الإنترنت. راجع `journalctl -u caddy -n 100 --no-pager`. إذا كان هناك DNS proxy أو CDN، تحقق من أن طلبات ACME تصل إلى Caddy وأن وضع TLS في ذلك الوسيط لا يمنع الاتصال.
 
-**فشل `healthz` المحلي:** افحص `journalctl -u zyrln-relay -n 100 --no-pager` وملف `/etc/zyrln-relay.env` وصلاحيات الخدمة.
+**يفشل `healthz` عبر HTTPS:** تحقق من `systemctl status zyrln-relay caddy` ومن أن `zyrln-relay` يستمع إلى `127.0.0.1:8787`. افحص أن Caddyfile يشير إلى النطاق نفسه والمنفذ المحلي الصحيح.
 
-**يعمل محليًا ولا يعمل من الخارج:** افحص جدار مزود VPS أولًا، ثم UFW، ثم عنوان IP العام والمنفذ `8787/TCP`.
+**Apps Script يعرض Unauthorized:** `AUTH_KEY` هو مفتاح التطبيق، و`EXIT_RELAY_KEY` هو مفتاح الخروج. تأكد من أن كل قيمة في Apps Script تطابق قيمتها في الملف/التطبيق، ثم انشر نسخة جديدة.
 
-**Apps Script يعرض Unauthorized:** تحقق من تطابق `AUTH_KEY` مع مفتاح Android، ومن تطابق `EXIT_RELAY_KEY` مع مفتاح الخروج على VPS، ثم انشر إصدارًا جديدًا.
-
-**بعض التطبيقات أو المكالمات لا تعمل:** تذكر أن نفق Android في هذا الإصدار TCP فقط، وقد لا يدعم وظائف UDP.
+**يعمل الموقع عبر HTTPS لكن لا يعمل التطبيق:** تحقق من استخدام APK وCode.gs من الإصدار نفسه، ورابط Apps Script المنتهي بـ`/exec`، وأذونات VPN في Android. أوقف أي VPN آخر مؤقتًا.
 
 ## مصادر رسمية
 
-[1]: https://github.com/ajavadinezhad/zyrln "شرح بنية Zyrln وإعداد الـrelay"
-[2]: https://ubuntu.com/server/docs/how-to/security/firewalls "توثيق Ubuntu لجدار UFW"
-[3]: https://developers.google.com/apps-script/guides/web "توثيق Google Apps Script Web Apps"
-[4]: https://github.com/ajavadinezhad/zyrln/blob/main/docs/fa/guide.md "دليل استخدام Zyrln على Android"
+[1]: https://caddyserver.com/docs/automatic-https "توثيق Caddy لإدارة HTTPS التلقائية والتحويلات"
+[2]: https://caddyserver.com/docs/quick-starts/https "دليل Caddy الرسمي لشهادات HTTPS ومتطلبات DNS والمنافذ"
+[3]: https://caddyserver.com/docs/install "تعليمات تثبيت Caddy الرسمية على Ubuntu"
+[4]: https://ubuntu.com/server/docs/how-to/security/firewalls "توثيق Ubuntu لجدار UFW"
+[5]: https://developers.google.com/apps-script/guides/web "توثيق Google Apps Script Web Apps"
+[6]: https://github.com/ajavadinezhad/zyrln/releases/tag/v2.0 "إصدار Zyrln المستقر v2.0 وقيود نفق TCP"
