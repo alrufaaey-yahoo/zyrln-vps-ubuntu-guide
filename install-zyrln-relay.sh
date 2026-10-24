@@ -4,9 +4,9 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-readonly VERSION="v2.0"
+readonly ZYRLN_VERSION="v2.0"
 readonly RELEASE_ASSET="zyrln-2.0-vps.zip"
-readonly RELEASE_URL="https://github.com/ajavadinezhad/zyrln/releases/download/${VERSION}/${RELEASE_ASSET}"
+readonly RELEASE_URL="https://github.com/ajavadinezhad/zyrln/releases/download/${ZYRLN_VERSION}/${RELEASE_ASSET}"
 readonly INSTALL_BIN="/usr/local/bin/zyrln-relay"
 readonly ENV_FILE="/etc/zyrln-relay.env"
 readonly APP_KEY_FILE="/etc/zyrln-app-key"
@@ -133,7 +133,7 @@ if [[ "$CADDY_WAS_INSTALLED" != "yes" ]]; then
 fi
 command -v caddy >/dev/null 2>&1 || die "Caddy installation did not provide the caddy command."
 
-log "Downloading the official Zyrln ${VERSION} VPS bundle"
+log "Downloading the official Zyrln ${ZYRLN_VERSION} VPS bundle"
 TMP_DIR="$(mktemp -d -t zyrln-install.XXXXXX)"
 curl --fail --location --silent --show-error --retry 3 --retry-delay 2 \
   "$RELEASE_URL" -o "$TMP_DIR/$RELEASE_ASSET"
@@ -252,7 +252,7 @@ if [[ "$HEALTH_OK" != "yes" ]]; then
 fi
 
 printf '\n============================================================\n'
-printf 'Zyrln VPS relay installed with HTTPS (release %s)\n' "$VERSION"
+printf 'Zyrln VPS relay installed with HTTPS (release %s)\n' "$ZYRLN_VERSION"
 printf 'HTTPS endpoint:      https://%s\n' "$HOST"
 printf 'Relay service:       systemctl status zyrln-relay\n'
 printf 'Caddy service:       systemctl status caddy\n'
