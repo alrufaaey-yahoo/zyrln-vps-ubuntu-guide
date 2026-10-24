@@ -18,7 +18,7 @@ readonly SERVICE_USER="zyrln"
 PORT="${ZYRLN_RELAY_PORT:-8787}"
 KEY="${ZYRLN_RELAY_KEY:-}"
 APP_KEY="${ZYRLN_APP_KEY:-}"
-DOMAIN="${ZYRLN_DOMAIN:-${ZYRLN_PUBLIC_HOST:-}}"
+HOST="${ZYRLN_HOST:-${ZYRLN_DOMAIN:-${ZYRLN_PUBLIC_HOST:-}}}"
 TMP_DIR=""
 
 log() { printf '\n==> %s\n' "$*"; }
@@ -46,12 +46,23 @@ esac
 [[ "$PORT" =~ ^[0-9]+$ ]] && (( PORT >= 1024 && PORT <= 65535 )) || die "ZYRLN_RELAY_PORT must be a TCP port from 1024 to 65535."
 
 # A publicly trusted certificate is issued for a DNS name in this installer.
-# The bare VPS IP must not be used as the public Apps Script endpoint.
-if [[ -z "$DOMAIN" && -r /dev/tty ]]; then
-  printf 'Public DNS name for HTTPS, e.g. relay.example.com: ' >/dev/tty
-  IFS= read -r DOMAIN </dev/tty || DOMAIN=""
+# A public IPv4 can also use Let's Encrypt's short-lived IP certificate profile.
+if [[ -z "$HOST" ]]; then
+  HOST="$(curl -4 --fail --silent --show-error --max-time 8 https://api.ipify.org 2>/dev/null || true)"
 fi
-[[ "$DOMAIN" =~ ^([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,63}$ ]] || die "Set ZYRLN_DOMAIN to a public DNS name such as relay.example.com. A domain is required for this HTTPS setup."
+if [[ -z "$HOST" && -r /dev/tty ]]; then
+  printf 'Public IPv4 address or DNS hostname for HTTPS: ' >/dev/tty
+  IFS= read -r HOST </dev/tty || HOST=""
+fi
+IP_MODE="no"
+if [[ "$HOST" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+  awk -F. 'NF != 4 { exit 1 } { for (i=1; i<=4; i++) if ($i !~ /^[0-9]+$/ || $i > 255 || (length($i) > 1 && substr($i,1,1) == "0")) exit 1 }' <<<"$HOST" \
+    || die "Invalid public IPv4 address: $HOST"
+  IP_MODE="yes"
+else
+  [[ "$HOST" =~ ^([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,63}$ ]] \
+    || die "Enter a public IPv4 address or DNS hostname, for example 51.254.208.97 or relay.example.com."
+fi
 
 # Do not replace another administrator's Caddy configuration or take occupied
 # public web ports. Existing configuration created by this script is reusable.
@@ -182,14 +193,29 @@ systemctl daemon-reload
 systemctl enable --now zyrln-relay.service
 systemctl restart zyrln-relay.service
 
-log "Configuring Caddy-managed HTTPS for ${DOMAIN}"
-cat > "$CADDYFILE" <<CADDY
+log "Configuring Caddy-managed HTTPS for ${HOST}"
+if [[ "$IP_MODE" == "yes" ]]; then
+  cat > "$CADDYFILE" <<CADDY
 ${CADDY_MARKER}
-${DOMAIN} {
+${HOST} {
+    tls {
+        issuer acme https://acme-v02.api.letsencrypt.org/directory {
+            profile shortlived
+        }
+    }
     encode zstd gzip
     reverse_proxy 127.0.0.1:${PORT}
 }
 CADDY
+else
+  cat > "$CADDYFILE" <<CADDY
+${CADDY_MARKER}
+${HOST} {
+    encode zstd gzip
+    reverse_proxy 127.0.0.1:${PORT}
+}
+CADDY
+fi
 chmod 0644 "$CADDYFILE"
 caddy validate --config "$CADDYFILE" --adapter caddyfile
 
@@ -210,7 +236,7 @@ fi
 log "Waiting for Caddy to obtain a trusted certificate and serve HTTPS"
 HEALTH_OK="no"
 for _ in {1..60}; do
-  if curl --fail --silent --show-error --connect-timeout 4 "https://${DOMAIN}/healthz" >/dev/null 2>&1; then
+  if curl --fail --silent --show-error --connect-timeout 4 "https://${HOST}/healthz" >/dev/null 2>&1; then
     HEALTH_OK="yes"
     break
   fi
@@ -219,19 +245,22 @@ done
 if [[ "$HEALTH_OK" != "yes" ]]; then
   systemctl --no-pager --full status zyrln-relay.service caddy.service || true
   journalctl -u caddy.service -n 80 --no-pager || true
+  if [[ "$IP_MODE" == "yes" ]]; then
+    die "HTTPS health check failed. Confirm this public IPv4 belongs to the VPS and inbound TCP 80/443 are open in the provider firewall, then rerun the installer."
+  fi
   die "HTTPS health check failed. Confirm DNS A/AAAA points to this VPS and inbound TCP 80/443 are open in the provider firewall, then rerun the installer."
 fi
 
 printf '\n============================================================\n'
 printf 'Zyrln VPS relay installed with HTTPS (release %s)\n' "$VERSION"
-printf 'Domain:              https://%s\n' "$DOMAIN"
+printf 'HTTPS endpoint:      https://%s\n' "$HOST"
 printf 'Relay service:       systemctl status zyrln-relay\n'
 printf 'Caddy service:       systemctl status caddy\n'
-printf 'HTTPS health check:  curl https://%s/healthz\n' "$DOMAIN"
+printf 'HTTPS health check:  curl https://%s/healthz\n' "$HOST"
 printf '\nCopy these four lines into the top of Google Apps Script Code.gs:\n\n'
 printf 'const AUTH_KEY = "%s";\n' "$APP_KEY"
-printf 'const EXIT_RELAY_URL = "https://%s/relay";\n' "$DOMAIN"
-printf 'const EXIT_TUNNEL_URL = "https://%s/tunnel";\n' "$DOMAIN"
+printf 'const EXIT_RELAY_URL = "https://%s/relay";\n' "$HOST"
+printf 'const EXIT_TUNNEL_URL = "https://%s/tunnel";\n' "$HOST"
 printf 'const EXIT_RELAY_KEY = "%s";\n' "$KEY"
 printf '============================================================\n'
 printf 'Required provider firewall rules: inbound TCP 80 and TCP 443.\n'
@@ -242,4 +271,9 @@ if [[ "$KEY_WAS_GENERATED" == "yes" ]]; then
 fi
 if [[ "$APP_KEY_WAS_GENERATED" == "yes" ]]; then
   printf 'A new AUTH_KEY was generated. Save the values above in a password manager.\n'
+fi
+CADDY_VERSION="$(caddy version | awk 'NR == 1 { print $1 }' | sed 's/^v//')"
+if [[ "$IP_MODE" == "yes" ]]; then
+  dpkg --compare-versions "$CADDY_VERSION" ge "2.11.7" \
+    || die "Direct-IP certificates require Caddy 2.11.7 or newer. Installed version: ${CADDY_VERSION:-unknown}."
 fi
