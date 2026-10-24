@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Install/update the official Zyrln VPS relay behind Caddy-managed HTTPS.
-# Pinned to stable Zyrln v2.0. The public Apps Script URLs are HTTPS only.
+# Install/update the official Zyrln VPS relay behind Caddy-managed HTTP or HTTPS.
+# HTTP is unencrypted and requires explicit confirmation. Pinned to stable v2.0.
 set -Eeuo pipefail
 IFS=$'\n\t'
 
@@ -19,6 +19,9 @@ PORT="${ZYRLN_RELAY_PORT:-8787}"
 KEY="${ZYRLN_RELAY_KEY:-}"
 APP_KEY="${ZYRLN_APP_KEY:-}"
 HOST="${ZYRLN_HOST:-${ZYRLN_DOMAIN:-${ZYRLN_PUBLIC_HOST:-}}}"
+TRANSPORT="${ZYRLN_TRANSPORT:-}"
+PUBLIC_HTTP_PORT="${ZYRLN_HTTP_PORT:-}"
+HTTP_ACK="${ZYRLN_CONFIRM_INSECURE_HTTP:-}"
 TMP_DIR=""
 
 log() { printf '\n==> %s\n' "$*"; }
@@ -43,6 +46,39 @@ case "$(uname -m)" in
   *) die "Unsupported CPU architecture: $(uname -m). Supported: amd64 and arm64." ;;
 esac
 
+if [[ -z "$TRANSPORT" && -r /dev/tty ]]; then
+  printf 'Public connection mode: [1] HTTP (insecure, default)  [2] HTTPS (recommended): ' >/dev/tty
+  IFS= read -r TRANSPORT </dev/tty || TRANSPORT=""
+  case "${TRANSPORT,,}" in
+    ""|1|http) TRANSPORT="http" ;;
+    2|https) TRANSPORT="https" ;;
+    *) die "Choose 1/http or 2/https." ;;
+  esac
+elif [[ -z "$TRANSPORT" ]]; then
+  TRANSPORT="https"
+fi
+[[ "$TRANSPORT" == "http" || "$TRANSPORT" == "https" ]] || die "ZYRLN_TRANSPORT must be http or https."
+
+if [[ "$TRANSPORT" == "http" ]]; then
+  if [[ -z "$PUBLIC_HTTP_PORT" && -r /dev/tty ]]; then
+    printf 'Public HTTP TCP port [8080]: ' >/dev/tty
+    IFS= read -r PUBLIC_HTTP_PORT </dev/tty || PUBLIC_HTTP_PORT=""
+  fi
+  PUBLIC_HTTP_PORT="${PUBLIC_HTTP_PORT:-8080}"
+  [[ "$PUBLIC_HTTP_PORT" =~ ^[0-9]{1,5}$ ]] || die "ZYRLN_HTTP_PORT must be a TCP port from 1 to 65535."
+  PUBLIC_HTTP_PORT=$((10#$PUBLIC_HTTP_PORT))
+  (( PUBLIC_HTTP_PORT >= 1 && PUBLIC_HTTP_PORT <= 65535 )) || die "ZYRLN_HTTP_PORT must be a TCP port from 1 to 65535."
+  [[ "$PUBLIC_HTTP_PORT" != "$PORT" ]] || die "Public HTTP port must differ from the relay's loopback-only ZYRLN_RELAY_PORT."
+  log "WARNING: HTTP is unencrypted. The X-Relay-Key and relay traffic can be read or modified in transit. Use HTTPS on a trusted network only."
+  if [[ -r /dev/tty ]]; then
+    printf 'To continue with unencrypted public HTTP, type INSECURE: ' >/dev/tty
+    IFS= read -r HTTP_ACK </dev/tty || HTTP_ACK=""
+    [[ "$HTTP_ACK" == "INSECURE" ]] || die "HTTP was not confirmed; no installation changes have been made. Select HTTPS instead."
+  else
+    [[ "$HTTP_ACK" == "yes" ]] || die "Non-interactive HTTP requires ZYRLN_CONFIRM_INSECURE_HTTP=yes."
+  fi
+fi
+
 [[ "$PORT" =~ ^[0-9]+$ ]] && (( PORT >= 1024 && PORT <= 65535 )) || die "ZYRLN_RELAY_PORT must be a TCP port from 1024 to 65535."
 
 # A publicly trusted certificate is issued for a DNS name in this installer.
@@ -51,7 +87,7 @@ if [[ -z "$HOST" ]]; then
   HOST="$(curl -4 --fail --silent --show-error --max-time 8 https://api.ipify.org 2>/dev/null || true)"
 fi
 if [[ -z "$HOST" && -r /dev/tty ]]; then
-  printf 'Public IPv4 address or DNS hostname for HTTPS: ' >/dev/tty
+  printf 'Public IPv4 address or DNS hostname: ' >/dev/tty
   IFS= read -r HOST </dev/tty || HOST=""
 fi
 IP_MODE="no"
@@ -65,27 +101,50 @@ else
 fi
 
 # Do not replace another administrator's Caddy configuration or take occupied
-# port 443. If port 80 is occupied, leave its service untouched and use TLS-ALPN.
+# public ports. HTTP mode needs only the user-selected port; HTTPS uses 443.
 CADDY_WAS_INSTALLED="no"
 if dpkg-query -W -f='${Status}' caddy 2>/dev/null | grep -q 'install ok installed'; then
   CADDY_WAS_INSTALLED="yes"
 fi
 HTTP_PORT_AVAILABLE="yes"
 if [[ -e "$CADDYFILE" ]] && ! grep -Fq "$CADDY_MARKER" "$CADDYFILE"; then
-  die "$CADDYFILE already exists and is not managed by this installer. Back it up and merge the HTTPS reverse_proxy configuration manually; the installer will not overwrite it."
+  die "$CADDYFILE already exists and is not managed by this installer. Back it up and merge the reverse_proxy configuration manually; the installer will not overwrite it."
 fi
-if command -v ss >/dev/null 2>&1 && ! systemctl is-active --quiet caddy 2>/dev/null; then
-  if ss -ltnH 'sport = :80' 2>/dev/null | grep -q .; then
-    HTTP_PORT_AVAILABLE="no"
-    log "TCP port 80 is occupied; leaving its service untouched and using the TLS-ALPN challenge on 443 without HTTP redirects."
-  fi
-  if ss -ltnH 'sport = :443' 2>/dev/null | grep -q .; then
+if command -v ss >/dev/null 2>&1; then
+  CADDY_ACTIVE="no"
+  systemctl is-active --quiet caddy 2>/dev/null && CADDY_ACTIVE="yes"
+  if [[ "$TRANSPORT" == "http" ]]; then
+    HTTP_LISTENERS="$(ss -ltnp "sport = :${PUBLIC_HTTP_PORT}" 2>/dev/null || true)"
+    if [[ -n "$HTTP_LISTENERS" ]]; then
+      OTHER_HTTP_LISTENERS="$HTTP_LISTENERS"
+      if [[ "$CADDY_ACTIVE" == "yes" ]]; then
+        OTHER_HTTP_LISTENERS="$(printf '%s\n' "$HTTP_LISTENERS" | grep -v '"caddy"' || true)"
+      fi
+      if [[ -n "$OTHER_HTTP_LISTENERS" ]]; then
+        die "Selected TCP port ${PUBLIC_HTTP_PORT} is already in use. Current listener details:
+${HTTP_LISTENERS}
+
+Choose another free ZYRLN_HTTP_PORT. Nothing listening on the occupied port was changed."
+      fi
+    fi
+  else
+    if ss -ltnH 'sport = :80' 2>/dev/null | grep -q .; then
+      HTTP_PORT_AVAILABLE="no"
+      log "TCP port 80 is occupied; leaving its service untouched and using the TLS-ALPN challenge on 443 without HTTP redirects."
+    fi
     HTTPS_LISTENERS="$(ss -ltnp 'sport = :443' 2>/dev/null || true)"
-    [[ -n "$HTTPS_LISTENERS" ]] || HTTPS_LISTENERS="ss detected a listener, but it disappeared before process details could be read. Re-run the installer to check again."
-    die "TCP port 443 is already in use. Current listener details:
+    if [[ -n "$HTTPS_LISTENERS" ]]; then
+      OTHER_HTTPS_LISTENERS="$HTTPS_LISTENERS"
+      if [[ "$CADDY_ACTIVE" == "yes" ]]; then
+        OTHER_HTTPS_LISTENERS="$(printf '%s\n' "$HTTPS_LISTENERS" | grep -v '"caddy"' || true)"
+      fi
+      if [[ -n "$OTHER_HTTPS_LISTENERS" ]]; then
+        die "TCP port 443 is already in use. Current listener details:
 ${HTTPS_LISTENERS}
 
 Two independent services cannot bind the same address and TCP port. Sharing 443 requires configuring the existing TLS/HTTP proxy to route traffic to both services; this installer will not stop or rewrite the current service. Use a DNS hostname and configure hostname/SNI routing in that proxy, or free 443 through your own maintenance procedure. Nothing listening on port 80 was changed."
+      fi
+    fi
   fi
 fi
 
@@ -201,65 +260,80 @@ systemctl daemon-reload
 systemctl enable --now zyrln-relay.service
 systemctl restart zyrln-relay.service
 
-log "Configuring Caddy-managed HTTPS for ${HOST}"
-if [[ "$HTTP_PORT_AVAILABLE" == "no" ]]; then
-  cat > "$CADDYFILE" <<'CADDY'
+log "Configuring Caddy-managed ${TRANSPORT^^} for ${HOST}"
+: > "$CADDYFILE"
+if [[ "$TRANSPORT" == "http" ]]; then
+  cat > "$CADDYFILE" <<CADDY
+${CADDY_MARKER}
+http://${HOST}:${PUBLIC_HTTP_PORT} {
+    encode zstd gzip
+    reverse_proxy 127.0.0.1:${PORT}
+}
+CADDY
+else
+  if [[ "$HTTP_PORT_AVAILABLE" == "no" ]]; then
+    cat > "$CADDYFILE" <<'CADDY'
 {
     auto_https disable_redirects
 }
 
 CADDY
-fi
-if [[ "$IP_MODE" == "yes" ]]; then
-  cat >> "$CADDYFILE" <<CADDY
+  fi
+  if [[ "$IP_MODE" == "yes" ]]; then
+    cat >> "$CADDYFILE" <<CADDY
 ${CADDY_MARKER}
 ${HOST} {
     tls {
         issuer acme https://acme-v02.api.letsencrypt.org/directory {
             profile shortlived
 CADDY
-  if [[ "$HTTP_PORT_AVAILABLE" == "no" ]]; then
-    cat >> "$CADDYFILE" <<'CADDY'
+    if [[ "$HTTP_PORT_AVAILABLE" == "no" ]]; then
+      cat >> "$CADDYFILE" <<'CADDY'
             disable_http_challenge
 CADDY
-  fi
-  cat >> "$CADDYFILE" <<CADDY
+    fi
+    cat >> "$CADDYFILE" <<CADDY
         }
     }
     encode zstd gzip
     reverse_proxy 127.0.0.1:${PORT}
 }
 CADDY
-else
-  cat >> "$CADDYFILE" <<CADDY
+  else
+    cat >> "$CADDYFILE" <<CADDY
 ${CADDY_MARKER}
 ${HOST} {
 CADDY
-  if [[ "$HTTP_PORT_AVAILABLE" == "no" ]]; then
-    cat >> "$CADDYFILE" <<'CADDY'
+    if [[ "$HTTP_PORT_AVAILABLE" == "no" ]]; then
+      cat >> "$CADDYFILE" <<'CADDY'
     tls {
         issuer acme {
             disable_http_challenge
         }
     }
 CADDY
-  fi
-  cat >> "$CADDYFILE" <<CADDY
+    fi
+    cat >> "$CADDYFILE" <<CADDY
     encode zstd gzip
     reverse_proxy 127.0.0.1:${PORT}
 }
 CADDY
+  fi
 fi
 chmod 0644 "$CADDYFILE"
 caddy validate --config "$CADDYFILE" --adapter caddyfile
 
-# Open standard HTTP/HTTPS ports only if the host firewall is already enabled.
-# Caddy redirects HTTP to HTTPS. The relay itself is bound to 127.0.0.1 only.
+# Open only the selected public port when the host firewall is already enabled.
+# The relay itself is always bound to 127.0.0.1 only.
 if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q 'Status: active'; then
-  if [[ "$HTTP_PORT_AVAILABLE" == "yes" ]]; then
-    ufw allow 80/tcp || die "Could not open TCP 80 in UFW."
+  if [[ "$TRANSPORT" == "http" ]]; then
+    ufw allow "${PUBLIC_HTTP_PORT}/tcp" || die "Could not open TCP ${PUBLIC_HTTP_PORT} in UFW."
+  else
+    if [[ "$HTTP_PORT_AVAILABLE" == "yes" ]]; then
+      ufw allow 80/tcp || die "Could not open TCP 80 in UFW."
+    fi
+    ufw allow 443/tcp || die "Could not open TCP 443 in UFW."
   fi
-  ufw allow 443/tcp || die "Could not open TCP 443 in UFW."
 fi
 
 systemctl enable caddy
@@ -269,10 +343,16 @@ else
   systemctl start caddy
 fi
 
-log "Waiting for Caddy to obtain a trusted certificate and serve HTTPS"
+if [[ "$TRANSPORT" == "http" ]]; then
+  BASE_URL="http://${HOST}:${PUBLIC_HTTP_PORT}"
+else
+  BASE_URL="https://${HOST}"
+fi
+
+log "Waiting for Caddy to serve ${TRANSPORT^^}"
 HEALTH_OK="no"
 for _ in {1..60}; do
-  if curl --fail --silent --show-error --connect-timeout 4 "https://${HOST}/healthz" >/dev/null 2>&1; then
+  if curl --fail --silent --show-error --connect-timeout 4 "${BASE_URL}/healthz" >/dev/null 2>&1; then
     HEALTH_OK="yes"
     break
   fi
@@ -281,27 +361,41 @@ done
 if [[ "$HEALTH_OK" != "yes" ]]; then
   systemctl --no-pager --full status zyrln-relay.service caddy.service || true
   journalctl -u caddy.service -n 80 --no-pager || true
-  if [[ "$IP_MODE" == "yes" ]]; then
+  if [[ "$TRANSPORT" == "http" ]]; then
+    die "HTTP health check failed. Confirm this host points to the VPS and inbound TCP ${PUBLIC_HTTP_PORT} is allowed by the provider firewall. Then rerun the installer."
+  elif [[ "$IP_MODE" == "yes" ]]; then
     die "HTTPS health check failed. Confirm this public IPv4 belongs to the VPS and inbound TCP 443 is open in the provider firewall. If TCP 80 was free, also allow TCP 80. Then rerun the installer."
   fi
   die "HTTPS health check failed. Confirm DNS A/AAAA points to this VPS and inbound TCP 443 is open in the provider firewall. If TCP 80 was free, also allow TCP 80. Then rerun the installer."
 fi
 
 printf '\n============================================================\n'
-printf 'Zyrln VPS relay installed with HTTPS (release %s)\n' "$ZYRLN_VERSION"
-printf 'HTTPS endpoint:      https://%s\n' "$HOST"
+printf 'Zyrln VPS relay installed with %s (release %s)\n' "${TRANSPORT^^}" "$ZYRLN_VERSION"
+printf 'Endpoint base URL:   %s\n' "$BASE_URL"
 printf 'Relay service:       systemctl status zyrln-relay\n'
 printf 'Caddy service:       systemctl status caddy\n'
-printf 'HTTPS health check:  curl https://%s/healthz\n' "$HOST"
+printf 'Health check:        curl %s/healthz\n' "$BASE_URL"
 printf '\nCopy these four lines into the top of Google Apps Script Code.gs:\n\n'
 printf 'const AUTH_KEY = "%s";\n' "$APP_KEY"
-printf 'const EXIT_RELAY_URL = "https://%s/relay";\n' "$HOST"
-printf 'const EXIT_TUNNEL_URL = "https://%s/tunnel";\n' "$HOST"
+printf 'const EXIT_RELAY_URL = "%s/relay";\n' "$BASE_URL"
+printf 'const EXIT_TUNNEL_URL = "%s/tunnel";\n' "$BASE_URL"
 printf 'const EXIT_RELAY_KEY = "%s";\n' "$KEY"
 printf '============================================================\n'
-printf 'Required provider firewall rules: inbound TCP 80 and TCP 443.\n'
+if [[ "$TRANSPORT" == "http" ]]; then
+  printf 'Required provider firewall rule: inbound TCP %s.\n' "$PUBLIC_HTTP_PORT"
+else
+  if [[ "$HTTP_PORT_AVAILABLE" == "yes" ]]; then
+    printf 'Required provider firewall rules: inbound TCP 80 and TCP 443.\n'
+  else
+    printf 'Required provider firewall rule: inbound TCP 443. Existing TCP 80 service was left untouched.\n'
+  fi
+fi
 printf 'The Zyrln relay listens on 127.0.0.1:%s only; do not expose port %s publicly.\n' "$PORT" "$PORT"
-printf 'Keep the printed keys private. HTTP on the domain is redirected to HTTPS by Caddy.\n'
+if [[ "$TRANSPORT" == "http" ]]; then
+  printf 'INSECURE: HTTP is unencrypted. The relay key and traffic can be intercepted or modified in transit.\n'
+else
+  printf 'Keep the printed keys private. HTTP on the domain is redirected to HTTPS by Caddy.\n'
+fi
 if [[ "$KEY_WAS_GENERATED" == "yes" ]]; then
   printf 'A new EXIT_RELAY_KEY was generated. Save the values above in a password manager.\n'
 fi
@@ -309,12 +403,7 @@ if [[ "$APP_KEY_WAS_GENERATED" == "yes" ]]; then
   printf 'A new AUTH_KEY was generated. Save the values above in a password manager.\n'
 fi
 CADDY_VERSION="$(caddy version | awk 'NR == 1 { print $1 }' | sed 's/^v//')"
-if [[ "$IP_MODE" == "yes" ]]; then
+if [[ "$TRANSPORT" == "https" && "$IP_MODE" == "yes" ]]; then
   dpkg --compare-versions "$CADDY_VERSION" ge "2.11.7" \
     || die "Direct-IP certificates require Caddy 2.11.7 or newer. Installed version: ${CADDY_VERSION:-unknown}."
-fi
-if [[ "$HTTP_PORT_AVAILABLE" == "yes" ]]; then
-  printf 'Required provider firewall rules: inbound TCP 80 and TCP 443.\n'
-else
-  printf 'Required provider firewall rule: inbound TCP 443. Existing TCP 80 service was left untouched.\n'
 fi
